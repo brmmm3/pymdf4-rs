@@ -15,7 +15,7 @@ name = "pymdf4"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.30", features = ["extension-module"] }
+pyo3 = "0.30"
 numpy = "0.30"
 mdf4-rs = { git = "https://github.com/brmmm3/mdf4-rs.git", tag = "0.7.0", features = ["std", "compression"] }
 #mdf4-rs = { path = "../mdf4-rs", features = ["std", "compression"] }

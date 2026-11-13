@@ -119,8 +119,10 @@ from variable-length channel groups are rejected. The index stores an offset
 per record, and opening an unfinalized file scans its data.
 This recovery applies to `MdfFile`; `load_mf4` has separate parser limitations.
 
-On Windows, build the extension with `cargo build`, copy the resulting
-`target/debug/pymdf4.dll` to `pymdf4.pyd`, and put it on Python's import path.
+Build wheels with maturin 1.9.4 or newer. For a manual extension build, set
+`PYO3_BUILD_EXTENSION_MODULE=1` when running `cargo build`. On Windows, copy
+the resulting `target/debug/pymdf4.dll` to `pymdf4.pyd` and put it on Python's
+import path. Run Rust tests with `cargo test` without that environment variable.
 The integration tests require `numpy` and `asammdf` and can be run with
 `python -m unittest discover -s tests -v` after building the extension.
 Wheels built with maturin include the Python type stubs and `py.typed` marker.
