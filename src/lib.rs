@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mdf4_rs::index::{IndexedChannel, IndexedChannelGroup, RecoveredMdfIndex, TimeRangeData};
 use mdf4_rs::parsing::decoder::decode_channel_value_with_validity;
@@ -12,6 +12,8 @@ use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use rayon::prelude::*;
+
+mod stream;
 
 const DEFAULT_DENSE_LIMIT: usize = 10_000_000;
 type MergedBases = HashMap<Vec<usize>, (Arc<Vec<f64>>, Vec<usize>)>;
@@ -47,7 +49,9 @@ struct SparseReplayData {
 #[pyclass]
 struct MdfFile {
     source: String,
-    index: RecordingIndex,
+    index: Arc<RecordingIndex>,
+    time_indices: Vec<OnceLock<Vec<(f64, u64)>>>,
+    stream: Mutex<Option<stream::Stream>>,
 }
 
 enum RecordingIndex {
@@ -76,7 +80,17 @@ impl MdfFile {
                 }
             })
             .map_err(mdf_error)?;
-        Ok(Self { source, index })
+        let group_count = match &index {
+            RecordingIndex::Finalized(index) => index.channel_groups.len(),
+            RecordingIndex::Recovered(index) => index.channel_groups().len(),
+        };
+        let time_indices = (0..group_count).map(|_| OnceLock::new()).collect();
+        Ok(Self {
+            source,
+            index: Arc::new(index),
+            time_indices,
+            stream: Mutex::new(None),
+        })
     }
 
     #[getter]
@@ -194,17 +208,200 @@ impl MdfFile {
         let metadata = self.group(group)?;
         let selected = numeric_channel_index(metadata, channel)?;
         let time = group_time_index(metadata)?;
-        let data = self.read_group(py, group, &[selected], time, Some(start), Some(end))?;
-        Ok((
-            data.times,
-            numeric_values(data.values.into_iter().next().unwrap())?,
-        ))
+        let Some(time_index) = time else {
+            let data = self.read_group(py, group, &[selected], None, Some(start), Some(end))?;
+            return Ok((
+                data.times,
+                numeric_values(data.values.into_iter().next().unwrap())?,
+            ));
+        };
+        if metadata.record_count > (1u64 << 53) {
+            let data = self.read_group(py, group, &[selected], time, Some(start), Some(end))?;
+            return Ok((
+                data.times,
+                numeric_values(data.values.into_iter().next().unwrap())?,
+            ));
+        }
+        let index = &self.time_indices[group];
+        if index.get().is_none() {
+            let times = self.read_group(py, group, &[], time, None, None)?.times;
+            let entries = py.detach(|| {
+                let mut entries: Vec<_> = times
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(record, time)| (!time.is_nan()).then_some((time, record as u64)))
+                    .collect();
+                entries.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+                entries
+            });
+            let _ = index.set(entries);
+        }
+        let entries = index.get().unwrap();
+        let range = py.detach(|| {
+            let first = entries.partition_point(|(time, _)| *time < start);
+            let last = entries.partition_point(|(time, _)| *time <= end);
+            entries[first..last]
+                .iter()
+                .map(|(_, record)| *record)
+                .fold(None, |range, record| {
+                    Some(match range {
+                        Some((minimum, maximum)) => {
+                            (u64::min(minimum, record), u64::max(maximum, record))
+                        }
+                        None => (record, record),
+                    })
+                })
+        });
+        let Some((minimum, maximum)) = range else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let data = self.read_group(
+            py,
+            group,
+            &[selected, time_index],
+            None,
+            Some(minimum as f64),
+            Some(maximum as f64),
+        )?;
+        let mut columns = data.values.into_iter();
+        let values = columns.next().unwrap();
+        let times = numeric_values(columns.next().unwrap())?;
+        let (times, values) = times
+            .into_iter()
+            .zip(values)
+            .filter(|(time, _)| !time.is_nan() && *time >= start && *time <= end)
+            .unzip::<_, _, Vec<_>, Vec<_>>();
+        Ok((times, numeric_values(values)?))
+    }
+
+    /// Start prefetching selected channels from an inclusive time position.
+    fn stream_start(
+        &self,
+        py: Python<'_>,
+        start: f64,
+        channels: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let channels = self.stream_channels(channels)?;
+        stream::validate_position(start)?;
+        let stream = stream::Stream::start(
+            Arc::clone(&self.index),
+            self.source.clone(),
+            start,
+            channels,
+        )?;
+        let previous = self.stream.lock().unwrap().replace(stream);
+        py.detach(|| drop(previous));
+        Ok(())
+    }
+
+    /// Return the next samples, optionally waiting up to timeout seconds; otherwise return None while loading.
+    #[pyo3(signature = (timeout=None))]
+    fn stream_read<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: Option<f64>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let reader = self
+            .stream
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Stream is not running"))?
+            .reader();
+        let Some(samples) = py.detach(|| reader.read(timeout))? else {
+            return Ok(None);
+        };
+        let result = PyDict::new(py);
+        for (key, sample) in samples {
+            match key {
+                stream::ChannelKey::Name(name) => result.set_item(name, sample)?,
+                stream::ChannelKey::Group(group, name) => result.set_item((group, name), sample)?,
+            }
+        }
+        Ok(Some(result))
+    }
+
+    /// Stop the worker and discard prefetched samples.
+    fn stream_stop(&self, py: Python<'_>) {
+        let stream = self.stream.lock().unwrap().take();
+        py.detach(|| drop(stream));
+    }
+
+    /// Restart prefetching at an inclusive time position.
+    fn stream_set_pos(&self, position: f64) -> PyResult<()> {
+        stream::validate_position(position)?;
+        let guard = self.stream.lock().unwrap();
+        guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Stream is not running"))?
+            .set_position(position)
+    }
+
+    /// Replace the selected channels and resume at the current stream position.
+    fn stream_set_channels(&self, channels: &Bound<'_, PyAny>) -> PyResult<()> {
+        let channels = self.stream_channels(channels)?;
+        let guard = self.stream.lock().unwrap();
+        guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Stream is not running"))?
+            .set_channels(channels)
     }
 }
 
 impl MdfFile {
+    fn stream_channels(&self, channels: &Bound<'_, PyAny>) -> PyResult<Vec<stream::StreamChannel>> {
+        let mut selected = Vec::new();
+        let mut seen = HashSet::new();
+        for item in channels.try_iter()? {
+            let item = item?;
+            let (key, group, name) = if let Ok(name) = item.extract::<String>() {
+                let mut matching = self.groups().iter().enumerate().filter(|(_, group)| {
+                    group
+                        .channels
+                        .iter()
+                        .any(|channel| channel.name.as_deref() == Some(&name))
+                });
+                let (group, _) = matching
+                    .next()
+                    .ok_or_else(|| PyKeyError::new_err(name.clone()))?;
+                if matching.next().is_some() {
+                    return Err(PyValueError::new_err(format!(
+                        "Ambiguous channel name: {name}"
+                    )));
+                }
+                (stream::ChannelKey::Name(name.clone()), group, name)
+            } else {
+                let (group, name): (usize, String) = item.extract()?;
+                (stream::ChannelKey::Group(group, name.clone()), group, name)
+            };
+            let metadata = self.group(group)?;
+            let channel = numeric_channel_index(metadata, &name)?;
+            let time = group_time_index(metadata)?;
+            if metadata.record_count > (1u64 << 53) {
+                return Err(PyValueError::new_err(
+                    "Record indices above 2^53 are not supported",
+                ));
+            }
+            if !seen.insert((group, channel)) {
+                return Err(PyValueError::new_err("Duplicate stream channel"));
+            }
+            selected.push(stream::StreamChannel {
+                key,
+                group,
+                channel,
+                time,
+            });
+        }
+        if selected.is_empty() {
+            return Err(PyValueError::new_err(
+                "At least one stream channel is required",
+            ));
+        }
+        Ok(selected)
+    }
+
     fn groups(&self) -> &[IndexedChannelGroup] {
-        match &self.index {
+        match self.index.as_ref() {
             RecordingIndex::Finalized(index) => &index.channel_groups,
             RecordingIndex::Recovered(index) => index.channel_groups(),
         }
@@ -232,14 +429,16 @@ impl MdfFile {
                 values: vec![Vec::new(); channels.len()],
             });
         }
-        if matches!(&self.index, RecordingIndex::Finalized(_)) && metadata.data_blocks.is_empty() {
+        if matches!(self.index.as_ref(), RecordingIndex::Finalized(_))
+            && metadata.data_blocks.is_empty()
+        {
             return Err(PyRuntimeError::new_err(
                 "MDF group has no indexed data blocks",
             ));
         }
         py.detach(|| {
             let mut reader = BufferedRangeReader::new(&self.source)?;
-            match &self.index {
+            match self.index.as_ref() {
                 RecordingIndex::Finalized(index) => {
                     index.read_group_time_range(group, channels, time, start, end, &mut reader)
                 }

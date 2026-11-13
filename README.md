@@ -61,6 +61,53 @@ the group's timestamps. Unsupported indexed layouts, including interleaved recor
 IDs and nested conversions, return errors instead of falling back to full loading.
 Keep the recording unchanged while its `MdfFile` index is in use.
 
+For groups with explicit timestamps, the first `channel_time_slice` scans and
+indexes that group's timestamps. Later slices reuse the index and read only the
+span containing matching records, so narrow windows are faster when timestamps
+are mostly in order. The index uses approximately 16 bytes per non-NaN sample
+until the `MdfFile` is released. Unsorted timestamps remain supported but may
+require reading a larger span. This cache does not apply to `load_mf4`.
+
+For continuous reads, use the streaming methods on `MdfFile`:
+
+```python
+recording.stream_start(0.0, [(646, "MisfDet_stcEmiMisfCntrCyl_[1]")])
+try:
+  while True:
+    try:
+      samples = recording.stream_read(timeout=5.0)
+    except StopIteration:
+      break
+    print(samples)
+finally:
+  recording.stream_stop()
+```
+
+`stream_start(start, channels)` starts a background reader. Channels may be
+unique names or `(group_index, name)` pairs; use pairs for ambiguous names.
+Only scalar numeric channels are supported, and the same channel cannot be
+selected twice. Calling `stream_start` again replaces the existing stream.
+
+`stream_read()` returns `None` immediately while any active channel needs data.
+`stream_read(timeout=seconds)` instead waits up to the specified non-negative,
+finite number of seconds and raises `TimeoutError` if data is still unavailable.
+A timeout of zero checks immediately and raises `TimeoutError` if not ready.
+When data is available, either form returns a dictionary keyed by the requested
+channel identifiers with one `(timestamp, value)` per channel. A channel that finishes before the others has
+the value `None`. When all channels finish, it raises `StopIteration`. Samples
+retain each group's record order and are not synchronized across groups;
+NaN timestamps are excluded. Background read errors raise `RuntimeError`.
+Groups without a `time` channel use record indices as timestamps.
+
+`stream_set_pos(time)` discards buffered data and starts again at the inclusive
+time, and `stream_set_channels(channels)` replaces the selection from the
+greatest timestamp already returned (or the start/seek position before any
+read). Both operations restart reading in the background. With unsorted
+timestamps, the latter can repeat or omit earlier records. `stream_stop()`
+stops and joins the worker; it is safe to call more than once. Prefetching is
+bounded per channel, but startup and seeking may require scanning records before
+the requested time. The recording must remain unchanged while streaming.
+
 For unfinalized recordings, `MdfFile` recovers record counts and indexes
 interleaved fixed-size records without modifying the file. This supports direct
 DT data blocks and the standard finalization flags for channel group counts,
@@ -76,9 +123,12 @@ On Windows, build the extension with `cargo build`, copy the resulting
 `target/debug/pymdf4.dll` to `pymdf4.pyd`, and put it on Python's import path.
 The integration tests require `numpy` and `asammdf` and can be run with
 `python -m unittest discover -s tests -v` after building the extension.
+Wheels built with maturin include the Python type stubs and `py.typed` marker.
 
 Run `python examples/load_testdata.py` to load and summarize the bundled
 `testdata/11-bit-obd2.MF4` recording.
 Run `python examples/read_mdf_structure.py` to list its groups and channels.
 Run `python examples/inspect_mf4.py [path]` for timeline and channel slice
 operations; the path defaults to `testdata/11-bit-obd2.MF4`.
+Run `python examples/stream_mf4.py` for streaming reads, seeking, and channel
+selection using `testdata/test.mf4`; use `--help` for other recordings.

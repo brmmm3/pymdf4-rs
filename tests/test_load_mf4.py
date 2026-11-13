@@ -4,6 +4,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -16,6 +17,16 @@ import pymdf4
 
 def signal(name, values, times, **kwargs):
     return Signal(np.asarray(values), np.asarray(times, dtype=np.float64), name=name, **kwargs)
+
+
+def read_stream(recording, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = recording.stream_read()
+        if value is not None:
+            return value
+        threading.Event().wait(0.001)
+    raise AssertionError("Stream did not produce data")
 
 
 class LoadMf4Tests(unittest.TestCase):
@@ -68,6 +79,121 @@ class LoadMf4Tests(unittest.TestCase):
         self.assertIn("shared", groups[1]["channels"])
         with self.assertRaises(RuntimeError):
             pymdf4.MdfFile(self.path.with_name("missing.mf4"))
+
+    def test_stream_lifecycle_and_record_order(self):
+        for compression in (0, 1, 2):
+            with self.subTest(compression=compression):
+                self.make_recording(compression)
+                recording = pymdf4.MdfFile(self.path)
+                with self.assertRaisesRegex(RuntimeError, "not running"):
+                    recording.stream_read()
+                recording.stream_start(1, [(0, "shared"), "other"])
+                self.assertEqual(read_stream(recording), {(0, "shared"): (2, 20), "other": (1, 5)})
+                self.assertEqual(read_stream(recording), {(0, "shared"): (1, 10), "other": (3, 6)})
+                self.assertEqual(read_stream(recording), {(0, "shared"): (1, 11), "other": None})
+                with self.assertRaises(StopIteration):
+                    read_stream(recording)
+                recording.stream_set_pos(0)
+                self.assertEqual(read_stream(recording), {(0, "shared"): (2, 20), "other": (1, 5)})
+                recording.stream_set_channels(["converted"])
+                self.assertEqual(read_stream(recording), {"converted": (2, 5)})
+                recording.stream_set_pos(1)
+                self.assertEqual(read_stream(recording), {"converted": (2, 5)})
+                recording.stream_stop()
+                recording.stream_stop()
+                with self.assertRaisesRegex(RuntimeError, "not running"):
+                    recording.stream_read()
+
+    def test_stream_selection_and_restart(self):
+        self.make_recording(compression=2)
+        recording = pymdf4.MdfFile(self.path)
+        with self.assertRaises(ValueError):
+            recording.stream_start(math.nan, ["other"])
+        with self.assertRaises(ValueError):
+            recording.stream_start(0, [])
+        with self.assertRaises(ValueError):
+            recording.stream_start(0, ["shared"])
+        with self.assertRaises(KeyError):
+            recording.stream_start(0, ["missing"])
+        with self.assertRaises(ValueError):
+            recording.stream_start(0, ["other", (1, "other")])
+        with self.assertRaises(ValueError):
+            recording.stream_start(0, ["matrix"])
+        recording.stream_start(0, ["other"])
+        recording.stream_set_pos(2)
+        recording.stream_set_pos(0)
+        recording.stream_start(3, ["other"])
+        self.assertEqual(read_stream(recording), {"other": (3, 6)})
+        with self.assertRaises(StopIteration):
+            read_stream(recording)
+        recording.stream_stop()
+
+    def test_stream_read_timeout(self):
+        self.make_recording(compression=2)
+        recording = pymdf4.MdfFile(self.path)
+        recording.stream_start(0, ["other"])
+        for timeout in (-1, math.nan, math.inf, -math.inf):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                recording.stream_read(timeout=timeout)
+        self.assertEqual(recording.stream_read(timeout=5), {"other": (1, 5)})
+        self.assertEqual(recording.stream_read(5), {"other": (3, 6)})
+        with self.assertRaises(StopIteration):
+            recording.stream_read(timeout=5)
+        with self.assertRaises(StopIteration):
+            recording.stream_read(timeout=0)
+        recording.stream_stop()
+
+    def test_stream_batch_boundaries_and_seek(self):
+        mdf = MDF(version="4.10")
+        times = np.arange(9000, dtype=np.float64)
+        mdf.append([signal("first", times * 2, times), signal("second", times * 3, times)], common_timebase=True)
+        mdf.save(self.path, overwrite=True, compression=2)
+        mdf.close()
+        recording = pymdf4.MdfFile(self.path)
+        recording.stream_start(0, ["first", "second"])
+        for index in range(5000):
+            self.assertEqual(read_stream(recording), {"first": (index, index * 2), "second": (index, index * 3)})
+        recording.stream_set_pos(8000)
+        recording.stream_set_channels(["second"])
+        self.assertEqual(read_stream(recording), {"second": (8000, 24000)})
+        recording.stream_set_pos(10000)
+        with self.assertRaises(StopIteration):
+            read_stream(recording)
+        recording.stream_set_pos(8999)
+        self.assertEqual(read_stream(recording), {"second": (8999, 26997)})
+        with self.assertRaises(StopIteration):
+            read_stream(recording)
+        recording.stream_stop()
+
+    def test_stream_worker_failure(self):
+        self.make_recording()
+        recording = pymdf4.MdfFile(self.path)
+        self.path.unlink()
+        recording.stream_start(0, ["other"])
+        with self.assertRaisesRegex(RuntimeError, "MDF error"):
+            read_stream(recording)
+        with self.assertRaisesRegex(RuntimeError, "MDF error"):
+            recording.stream_read(timeout=5)
+        with self.assertRaisesRegex(RuntimeError, "MDF error"):
+            recording.stream_set_pos(1)
+        recording.stream_stop()
+
+    def test_stream_large_compressed_recording(self):
+        path = Path(__file__).resolve().parents[1] / "testdata" / "test.mf4"
+        if not path.exists():
+            self.skipTest("testdata/test.mf4 is not available")
+        group = 646
+        name = "MisfDet_stcEmiMisfCntrCyl_[1]"
+        recording = pymdf4.MdfFile(path)
+        with MDF(path) as reference:
+            expected = reference.get(name, group=group)
+            start = 1.0
+            indices = np.flatnonzero(expected.timestamps >= start)[:2500]
+            recording.stream_start(start, [(group, name)])
+            actual = [read_stream(recording)[group, name] for _ in indices]
+            np.testing.assert_allclose([sample[0] for sample in actual], expected.timestamps[indices], rtol=0, atol=1e-12)
+            np.testing.assert_allclose([sample[1] for sample in actual], expected.samples[indices], equal_nan=True)
+            recording.stream_stop()
 
     def test_unfinalized_interleaved_recordings(self):
         testdata = Path(__file__).resolve().parents[1] / "testdata"
@@ -133,6 +259,13 @@ class LoadMf4Tests(unittest.TestCase):
         self.assertEqual(recording.timeline(0), [2, 0, 1, 1])
         self.assertEqual(recording.channel_slice(0, "converted", 1, 3), ([0, 1], [1, 3]))
         self.assertEqual(recording.channel_time_slice(0, "shared", 1, 2), ([2, 1, 1], [20, 10, 11]))
+        recording.stream_start(1, ["converted"])
+        self.assertEqual(read_stream(recording), {"converted": (2, 5)})
+        self.assertEqual(read_stream(recording), {"converted": (1, 3)})
+        self.assertEqual(read_stream(recording), {"converted": (1, 7)})
+        with self.assertRaises(StopIteration):
+            read_stream(recording)
+        recording.stream_stop()
 
     def test_indexed_timeline_and_slices(self):
         for compression in (0, 1, 2):
@@ -171,6 +304,37 @@ class LoadMf4Tests(unittest.TestCase):
         self.assertEqual(recording.time_bounds(0), (0, 2))
         self.assertEqual(recording.channel_slice(0, "first", 1, 3), ([1, 2], [5, 6]))
         self.assertEqual(recording.channel_time_slice(0, "first", 1, 2), ([1, 2], [5, 6]))
+
+    def test_repeated_time_slices_preserve_record_order(self):
+        for compression in (0, 1, 2):
+            with self.subTest(compression=compression):
+                mdf = MDF(version="4.10")
+                times = [2, math.nan, 1, 3, 1, -0.0, 0.0]
+                mdf.append([signal("first", range(len(times)), times)], common_timebase=True)
+                mdf.save(self.path, overwrite=True, compression=compression)
+                mdf.close()
+                recording = pymdf4.MdfFile(self.path)
+                self.assertEqual(recording.channel_time_slice(0, "first", 1, 2), ([2, 1, 1], [0, 2, 4]))
+                self.assertEqual(recording.channel_time_slice(0, "first", 1, 1), ([1, 1], [2, 4]))
+                self.assertEqual(recording.channel_time_slice(0, "first", 0, 0), ([-0.0, 0.0], [5, 6]))
+                self.assertEqual(recording.channel_time_slice(0, "first", 4, math.inf), ([], []))
+                self.assertEqual(recording.channel_time_slice(0, "first", -math.inf, math.inf),
+                                 ([2, 1, 3, 1, -0.0, 0.0], [0, 2, 3, 4, 5, 6]))
+
+    def test_repeated_slices_on_large_compressed_recording(self):
+        path = Path(__file__).resolve().parents[1] / "testdata" / "test.mf4"
+        if not path.exists():
+            self.skipTest("testdata/test.mf4 is not available")
+        recording = pymdf4.MdfFile(path)
+        group = 646
+        name = "MisfDet_stcEmiMisfCntrCyl_[1]"
+        with MDF(path) as reference:
+            expected = reference.get(name, group=group)
+            for start, end in ((1.0, 2.0), (2.0, 2.01), (1.0, 2.0), (50000.0, 50001.0)):
+                times, values = recording.channel_time_slice(group, name, start, end)
+                selected = (expected.timestamps >= start) & (expected.timestamps <= end)
+                np.testing.assert_allclose(times, expected.timestamps[selected], rtol=0, atol=1e-12)
+                np.testing.assert_allclose(values, expected.samples[selected], equal_nan=True)
 
     def test_filter_and_sparse(self):
         self.make_recording()

@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "pymdf4-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mdf4-rs",
  "numpy",
