@@ -129,10 +129,11 @@ Wheels built with maturin include the Python type stubs and `py.typed` marker.
 
 The wheel workflow builds and smoke-tests CPython 3.10 through 3.15 wheels
 for Linux x86-64 (manylinux 2.28), Windows x86-64, and macOS x86-64 and
-ARM64. Pushing a numeric release tag such as `0.2.0` or `v0.2.0` builds
+ARM64. Pushing a release tag of the form `x.y.z`, such as `0.2.0`, builds
 the wheels and attaches them to a GitHub release after all builds succeed.
-The workflow can also be run manually to build artifacts without publishing
-a release. Use a tag matching the package version in `Cargo.toml`.
+The workflow can also be run manually; it then publishes a release only if a
+release version tag points at the selected commit, and otherwise just builds
+artifacts. Use a tag matching the package version in `Cargo.toml`.
 
 To publish those release wheels, manually run `publish-test-pypi.yml` or
 `publish-pypi.yml` with the release tag. Each index must have a trusted

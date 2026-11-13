@@ -3,14 +3,38 @@ name: Build wheels
 on:
   push:
     tags:
-      - "[0-9]*"
-      - "v[0-9]*"
+      - "[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  release-tag:
+    name: Detect release tag
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find version tag on the current commit
+        id: detect
+        shell: bash
+        run: |
+          tags=$(git ls-remote --tags origin \
+            | awk -v sha="$GITHUB_SHA" '$1 == sha { sub("^refs/tags/", "", $2); sub("\\^\\{\\}$", "", $2); print $2 }' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -uV || true)
+          if [ -z "$tags" ]; then
+            echo "No release version tag points at $GITHUB_SHA."
+          elif [ "$(printf '%s\n' "$tags" | wc -l)" -gt 1 ]; then
+            echo "::error::Multiple release version tags point at $GITHUB_SHA: $(echo $tags)"
+            exit 1
+          else
+            echo "Release version tag for $GITHUB_SHA: $tags"
+          fi
+          echo "tag=$tags" >> "$GITHUB_OUTPUT"
+
   wheels:
     name: ${{ matrix.platform.name }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.platform.runner }}
@@ -55,8 +79,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: wheels
+    if: needs.release-tag.outputs.tag != ''
+    needs: [release-tag, wheels]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -68,6 +92,7 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.release-tag.outputs.tag }}
           files: dist/*.whl
           fail_on_unmatched_files: true
           generate_release_notes: true
