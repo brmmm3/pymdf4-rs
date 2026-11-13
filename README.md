@@ -127,6 +127,20 @@ The integration tests require `numpy` and `asammdf` and can be run with
 `python -m unittest discover -s tests -v` after building the extension.
 Wheels built with maturin include the Python type stubs and `py.typed` marker.
 
+The wheel workflow builds and smoke-tests CPython 3.10 through 3.15 wheels
+for Linux x86-64 (manylinux 2.28), Windows x86-64, and macOS x86-64 and
+ARM64. Pushing a numeric release tag such as `0.2.0` or `v0.2.0` builds
+the wheels and attaches them to a GitHub release after all builds succeed.
+The workflow can also be run manually to build artifacts without publishing
+a release. Use a tag matching the package version in `Cargo.toml`.
+
+To publish those release wheels, manually run `publish-test-pypi.yml` or
+`publish-pypi.yml` with the release tag. Each index must have a trusted
+publisher configured for this repository, the corresponding workflow file,
+and its GitHub environment (`testpypi` or `pypi`). See the
+[PyPI trusted publisher documentation](https://docs.pypi.org/trusted-publishers/adding-a-publisher/).
+These workflows publish wheels only and skip files already present on the index.
+
 Run `python examples/load_testdata.py` to load and summarize the bundled
 `testdata/11-bit-obd2.MF4` recording.
 Run `python examples/read_mdf_structure.py` to list its groups and channels.

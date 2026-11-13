@@ -1,0 +1,44 @@
+name: Publish on PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GitHub release tag"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  pypi-publish:
+    name: Upload release to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pymdf4-rs/
+    steps:
+      - name: Download wheels
+        uses: robinraju/release-downloader@v1 # zizmor: ignore[unpinned-uses]
+        with:
+          repository: ${{ github.repository }}
+          tag: ${{ inputs.tag }}
+          fileName: "pymdf4_rs-*.whl"
+          out-file-path: dist
+          extract: false
+
+      - name: Show what we got
+        run: ls -R dist
+
+      - name: Publish on PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1 # zizmor: ignore[unpinned-uses]
+        with:
+          repository-url: https://upload.pypi.org/legacy/
+          skip-existing: true
+          verbose: true
