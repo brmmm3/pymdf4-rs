@@ -2,7 +2,7 @@
 name = "pymdf4-rs"
 version = "0.2.0"
 edition = "2024"
-license = "MIT or Apache-2.0"
+license = "MIT OR Apache-2.0"
 authors = ["Martin Bammer <mrbm74@gmail.com>"]
 description = "A Python library for parsing and generating MDF4 files using Rust mdf4-rs"
 repository = "https://github.com/brmmm3/pymdf4-rs"

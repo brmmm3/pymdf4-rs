@@ -134,3 +134,8 @@ Run `python examples/inspect_mf4.py [path]` for timeline and channel slice
 operations; the path defaults to `testdata/11-bit-obd2.MF4`.
 Run `python examples/stream_mf4.py` for streaming reads, seeking, and channel
 selection using `testdata/test.mf4`; use `--help` for other recordings.
+
+## License
+
+Licensed under either the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option.
