@@ -1,5 +1,29 @@
 # pymdf4
 
+Python bindings for reading MDF 4 recordings, backed by `mdf4-rs`.
+
+## Installation
+
+Install from PyPI once the desired release is published:
+
+```sh
+python -m pip install pymdf4-rs
+```
+
+Or download a compatible wheel from the
+[GitHub releases](https://github.com/brmmm3/pymdf4-rs/releases) and install it
+with `python -m pip install path/to/wheel.whl`. Install NumPy separately if
+using sparse results.
+
+## Loading recordings
+
+```python
+import pymdf4
+
+recording = pymdf4.MdfFile("recording.mf4")
+print(recording.structure())
+```
+
 `pymdf4.load_mf4(path, keep=None, skipped=None, *, start=None, end=None)` loads scalar numeric MDF 4
 channels using `mdf4-rs`. `path` may be a string or `pathlib.Path`. The optional
 `keep` predicate receives each non-time channel name; rejected names are
@@ -21,7 +45,7 @@ The result has a `source` string and one of these forms:
 The default `pymdf4.DENSE_LIMIT` is 10,000,000 cells. Set it before calling
 `load_mf4` to select a different limit. NumPy is required for sparse results.
 Groups without a channel named `time` use sample indices for their time base.
-For bounded loads, the local `mdf4-rs` crate streams supported non-interleaved
+For bounded loads, `mdf4-rs` streams supported non-interleaved
 groups in bounded chunks and decodes only matching samples. It can skip data
 outside the range for groups using sample indices; explicit timestamps must be
 scanned, and compressed blocks must be decompressed to inspect them. Unbounded
@@ -34,8 +58,7 @@ groups and output columns are processed in parallel. The `keep` predicate and
 Python result creation still run with the GIL held. Sparse arrays use Rust-owned
 memory and cannot be resized in place.
 
-The vendored `mdf4-rs/` package is based on crate version 0.7.0 and retains
-its original licenses.
+## Indexed reads
 
 For indexed inspection and selected-channel reads, open a recording
 with `recording = pymdf4.MdfFile(path)`, where `path` is a string or `Path`:
@@ -67,6 +90,8 @@ span containing matching records, so narrow windows are faster when timestamps
 are mostly in order. The index uses approximately 16 bytes per non-NaN sample
 until the `MdfFile` is released. Unsorted timestamps remain supported but may
 require reading a larger span. This cache does not apply to `load_mf4`.
+
+## Streaming
 
 For continuous reads, use the streaming methods on `MdfFile`:
 
@@ -108,6 +133,8 @@ stops and joins the worker; it is safe to call more than once. Prefetching is
 bounded per channel, but startup and seeking may require scanning records before
 the requested time. The recording must remain unchanged while streaming.
 
+## Unfinalized recordings
+
 For unfinalized recordings, `MdfFile` recovers record counts and indexes
 interleaved fixed-size records without modifying the file. This supports direct
 DT data blocks and the standard finalization flags for channel group counts,
@@ -119,36 +146,17 @@ from variable-length channel groups are rejected. The index stores an offset
 per record, and opening an unfinalized file scans its data.
 This recovery applies to `MdfFile`; `load_mf4` has separate parser limitations.
 
-Build wheels with maturin 1.9.4 or newer. For a manual extension build, set
-`PYO3_BUILD_EXTENSION_MODULE=1` when running `cargo build`. On Windows, copy
-the resulting `target/debug/pymdf4.dll` to `pymdf4.pyd` and put it on Python's
-import path. Run Rust tests with `cargo test` without that environment variable.
-The integration tests require `numpy` and `asammdf` and can be run with
-`python -m unittest discover -s tests -v` after building the extension.
-Wheels built with maturin include the Python type stubs and `py.typed` marker.
+## Examples
 
-The wheel workflow builds and smoke-tests CPython 3.10 through 3.15 wheels
-for Linux x86-64 (manylinux 2.28), Windows x86-64, and macOS x86-64 and
-ARM64. Pushing a release tag of the form `x.y.z`, such as `0.2.0`, builds
-the wheels and attaches them to a GitHub release after all builds succeed.
-The workflow can also be run manually; it then publishes a release only if a
-release version tag points at the selected commit, and otherwise just builds
-artifacts. Use a tag matching the package version in `Cargo.toml`.
+The [examples directory](https://github.com/brmmm3/pymdf4-rs/tree/master/examples)
+contains scripts for loading, inspecting, and streaming recordings. From a
+repository checkout, run `python examples/inspect_mf4.py path/to/recording.mf4`
+or `python examples/stream_mf4.py --help`. The default sample recordings are not
+included in the repository; supply your own where the script accepts a path.
+Wheels include Python type stubs and a `py.typed` marker.
 
-To publish those release wheels, manually run `publish-test-pypi.yml` or
-`publish-pypi.yml` with the release tag. Each index must have a trusted
-publisher configured for this repository, the corresponding workflow file,
-and its GitHub environment (`testpypi` or `pypi`). See the
-[PyPI trusted publisher documentation](https://docs.pypi.org/trusted-publishers/adding-a-publisher/).
-These workflows publish wheels only and skip files already present on the index.
-
-Run `python examples/load_testdata.py` to load and summarize the bundled
-`testdata/11-bit-obd2.MF4` recording.
-Run `python examples/read_mdf_structure.py` to list its groups and channels.
-Run `python examples/inspect_mf4.py [path]` for timeline and channel slice
-operations; the path defaults to `testdata/11-bit-obd2.MF4`.
-Run `python examples/stream_mf4.py` for streaming reads, seeking, and channel
-selection using `testdata/test.mf4`; use `--help` for other recordings.
+For building, testing, and releasing the project, see the
+[developer documentation](https://github.com/brmmm3/pymdf4-rs/blob/master/DEVELOPER.md).
 
 ## License
 
